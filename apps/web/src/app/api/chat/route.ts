@@ -1,14 +1,14 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { createClient } from '@/lib/supabase/server';
 import { REQUIREMENTS_SYSTEM_PROMPT } from '@/lib/claude/prompts';
+import { getDemoResponse } from '@/lib/demo/responses';
 import { NextRequest } from 'next/server';
+import { cookies } from 'next/headers';
 
 const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
+  apiKey: process.env.ANTHROPIC_API_KEY ?? 'demo',
 });
 
-// data_extractionタグとrequirements_summaryタグをストリームから除去しつつ、
-// 構造化データはサーバー側で収集する
 function createStreamTransformer() {
   let buffer = '';
   let insideDataExtraction = false;
@@ -20,7 +20,6 @@ function createStreamTransformer() {
       buffer += chunk;
       let output = '';
 
-      // data_extractionタグを検出・除去
       while (buffer.length > 0) {
         if (insideDataExtraction) {
           const endTag = '</data_extraction>';
@@ -30,7 +29,6 @@ function createStreamTransformer() {
             buffer = buffer.slice(endIdx + endTag.length);
             insideDataExtraction = false;
           } else {
-            // まだ終了タグが来ていない
             const safeLen = Math.max(0, buffer.length - endTag.length);
             collectedExtraction += buffer.slice(0, safeLen);
             buffer = buffer.slice(safeLen);
@@ -41,13 +39,11 @@ function createStreamTransformer() {
           const startReqTag = '<requirements_summary>';
           const endReqTag = '</requirements_summary>';
 
-          // requirements_summaryタグの検索
           const reqStartIdx = buffer.indexOf(startReqTag);
           const reqEndIdx = buffer.indexOf(endReqTag);
           const dataStartIdx = buffer.indexOf(startDataTag);
 
           if (reqStartIdx !== -1 && reqEndIdx !== -1 && reqEndIdx > reqStartIdx) {
-            // requirements_summaryを抽出して保持（ユーザーには表示）
             output += buffer.slice(0, reqStartIdx + startReqTag.length);
             requirementsSummary = buffer.slice(reqStartIdx + startReqTag.length, reqEndIdx);
             output += requirementsSummary + endReqTag;
@@ -57,7 +53,6 @@ function createStreamTransformer() {
             buffer = buffer.slice(dataStartIdx + startDataTag.length);
             insideDataExtraction = true;
           } else {
-            // 安全な部分を出力
             const safeLen = Math.max(0, buffer.length - startDataTag.length);
             output += buffer.slice(0, safeLen);
             buffer = buffer.slice(safeLen);
@@ -73,33 +68,60 @@ function createStreamTransformer() {
       buffer = '';
       return output;
     },
-    getExtraction(): string {
-      return collectedExtraction;
-    },
-    getRequirementsSummary(): string {
-      return requirementsSummary;
-    },
+    getExtraction(): string { return collectedExtraction; },
+    getRequirementsSummary(): string { return requirementsSummary; },
   };
+}
+
+// デモモード: 文字単位でストリーミングをシミュレート
+async function* streamDemoResponse(text: string) {
+  for (const char of text) {
+    yield char;
+    await new Promise((r) => setTimeout(r, 18));
+  }
 }
 
 export async function POST(request: NextRequest) {
   try {
+    const cookieStore = await cookies();
+    const isDemoMode = cookieStore.get('demo_session')?.value === 'true';
+
+    // ─── デモモード ───────────────────────────────────────
+    if (isDemoMode) {
+      const { turnIndex = 0, message } = await request.json();
+      if (!message) return new Response('Bad Request', { status: 400 });
+
+      const responseText = getDemoResponse(turnIndex as number);
+      const encoder = new TextEncoder();
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          for await (const char of streamDemoResponse(responseText)) {
+            controller.enqueue(encoder.encode(char));
+          }
+          controller.close();
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-cache',
+        },
+      });
+    }
+
+    // ─── 通常モード (Supabase + Claude) ──────────────────
     const supabase = await createClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+    const { data: { user } } = await supabase.auth.getUser();
 
     if (!user) {
       return new Response('Unauthorized', { status: 401 });
     }
 
     const { projectId, message, phase = 'requirements' } = await request.json();
+    if (!projectId || !message) return new Response('Bad Request', { status: 400 });
 
-    if (!projectId || !message) {
-      return new Response('Bad Request', { status: 400 });
-    }
-
-    // プロジェクトの所有権確認
     const { data: project } = await supabase
       .from('projects')
       .select('*')
@@ -107,11 +129,8 @@ export async function POST(request: NextRequest) {
       .eq('user_id', user.id)
       .single();
 
-    if (!project) {
-      return new Response('Project not found', { status: 404 });
-    }
+    if (!project) return new Response('Project not found', { status: 404 });
 
-    // 過去のメッセージを取得
     const { data: historyMessages } = await supabase
       .from('messages')
       .select('role, content')
@@ -120,7 +139,6 @@ export async function POST(request: NextRequest) {
       .order('created_at', { ascending: true })
       .limit(20);
 
-    // ユーザーメッセージを保存
     await supabase.from('messages').insert({
       project_id: projectId,
       role: 'user',
@@ -128,7 +146,6 @@ export async function POST(request: NextRequest) {
       phase,
     });
 
-    // Claude APIに送るメッセージリストを構築
     const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [
       ...(historyMessages ?? []).map((m) => ({
         role: m.role as 'user' | 'assistant',
@@ -137,9 +154,6 @@ export async function POST(request: NextRequest) {
       { role: 'user', content: message },
     ];
 
-    const systemPrompt = REQUIREMENTS_SYSTEM_PROMPT;
-
-    // Streaming レスポンスを返す
     const encoder = new TextEncoder();
     const transformer = createStreamTransformer();
     let fullAssistantMessage = '';
@@ -150,30 +164,21 @@ export async function POST(request: NextRequest) {
           const claudeStream = await anthropic.messages.stream({
             model: 'claude-sonnet-4-6',
             max_tokens: 2048,
-            system: systemPrompt,
+            system: REQUIREMENTS_SYSTEM_PROMPT,
             messages,
           });
 
           for await (const chunk of claudeStream) {
-            if (
-              chunk.type === 'content_block_delta' &&
-              chunk.delta.type === 'text_delta'
-            ) {
+            if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
               const filtered = transformer.transform(chunk.delta.text);
               fullAssistantMessage += chunk.delta.text;
-              if (filtered) {
-                controller.enqueue(encoder.encode(filtered));
-              }
+              if (filtered) controller.enqueue(encoder.encode(filtered));
             }
           }
 
-          // フラッシュ
           const flushed = transformer.flush();
-          if (flushed) {
-            controller.enqueue(encoder.encode(flushed));
-          }
+          if (flushed) controller.enqueue(encoder.encode(flushed));
 
-          // AIの返答をDBに保存
           const cleanedMessage = fullAssistantMessage
             .replace(/<data_extraction>[\s\S]*?<\/data_extraction>/g, '')
             .trim();
@@ -189,21 +194,15 @@ export async function POST(request: NextRequest) {
             },
           });
 
-          // requirements_summaryがあればプロジェクトの要件JSONを更新
           const summaryJson = transformer.getRequirementsSummary();
           if (summaryJson) {
             try {
               const parsed = JSON.parse(summaryJson);
               await supabase
                 .from('projects')
-                .update({
-                  requirements_json: parsed,
-                  status: 'requirements_confirmed',
-                })
+                .update({ requirements_json: parsed, status: 'requirements_confirmed' })
                 .eq('id', projectId);
-            } catch {
-              // JSON解析エラーは無視
-            }
+            } catch { /* ignore */ }
           }
 
           controller.close();
