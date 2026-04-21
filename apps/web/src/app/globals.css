@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+:root {
+  --font-noto-sans-jp: 'Noto Sans JP', sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-noto-sans-jp), sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background-color: #f9fafb;
+  color: #111827;
+}
+
+/* スクロールバーを細くする */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 2px;
+}
+
+/* チャットエリアのスクロール */
+.chat-scroll {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
